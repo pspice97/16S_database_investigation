@@ -605,6 +605,8 @@ def plot_pcoa_from_square(
     names: list[str] | None = None,         # optional filter (normalized later as-is)
     out_coords_csv: Path | None = None,
     label_points: bool = False,
+    label_max: int = 200,
+    label_size: float = 6.0,
 ) -> None:
     """
     Run PCoA from the square identity matrix and plot colored by genus/species.
@@ -667,6 +669,25 @@ def plot_pcoa_from_square(
     ax.set_title(f"PCoA of pairwise distances (colored by {color_level})")
     ax.axhline(0, lw=0.5, color="#999", alpha=0.5)
     ax.axvline(0, lw=0.5, color="#999", alpha=0.5)
+
+    # Optional labels (sequence IDs)
+    if label_points:
+        if len(ids) > label_max:
+            # avoid wall-of-text; tell the user how many were suppressed
+            ax.text(0.99, 0.01,
+                    f"Labels suppressed ({len(ids)}>{label_max}). "
+                    f"Use --pcoa-label-max to override.",
+                    transform=ax.transAxes, ha="right", va="bottom", fontsize=8)
+        else:
+            # simple text labels with a faint outline for readability
+            try:
+                from matplotlib.patheffects import Stroke, Normal
+                pe = [Stroke(linewidth=2.0, foreground="white", alpha=0.9), Normal()]
+            except Exception:
+                pe = None
+            for (x, y), lab in zip(coords, ids):
+                ax.text(x, y, lab, fontsize=label_size, va="center", ha="left",
+                        path_effects=pe)
 
     # Reasonable aspect and legend outside
     ax.set_aspect("auto")
@@ -735,6 +756,13 @@ def parse_args() -> argparse.Namespace:
                    help="How to convert identities to distances for PCoA (default: 1 - identity/100).")
     p.add_argument("--pcoa-label-points", action="store_true", help="Label points with sequence IDs on the PCoA.")
 
+    # in parse_args()
+    p.add_argument("--pcoa-label-points", action="store_true",
+               help="Label PCoA points with sequence IDs.")
+    p.add_argument("--pcoa-label-max", type=int, default=200,
+               help="Maximum number of points to label to avoid clutter (default: 200).")
+    p.add_argument("--pcoa-label-size", type=float, default=6.0,
+               help="Font size for PCoA point labels (default: 6).")
 
     return p.parse_args()
 
@@ -793,6 +821,7 @@ def main() -> None:
     )
 
         # ----- PCoA (optional) -----
+        # ----- PCoA (optional) -----
     if args.out_pcoa:
         # Reuse parsed names (may be empty)
         names_for_pcoa = names if names else None
@@ -803,10 +832,12 @@ def main() -> None:
                 out_png=args.out_pcoa,
                 color_level=args.pcoa_color_level,
                 distance_mode=args.pcoa_distance,
-                names=names_for_pcoa,
+                names=names if names else None,
                 out_coords_csv=getattr(args, "out_pcoa_csv", None),
                 label_points=args.pcoa_label_points,
-            )
+                label_max=args.pcoa_label_max,
+                label_size=args.pcoa_label_size,
+    )
         except Exception as e:
             # Produce a diagnostic image instead of failing hard (keeps your UX consistent)
             plt.figure(figsize=(7, 6), dpi=150)

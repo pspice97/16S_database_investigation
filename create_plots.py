@@ -9,11 +9,12 @@ Color mapping for categories is consistent between the stacked and overlaid hist
 
 from __future__ import annotations
 import argparse
+import matplotlib
 from pathlib import Path
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
-
-import matplotlib
+import math
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.transforms import blended_transform_factory
@@ -342,6 +343,340 @@ def plot_overlaid_histogram_from_data(
     plt.close()
 
 
+# ---------- PCoA utilities ----------
+def identities_to_distance(mat: np.ndarray, mode: str = "one_minus_fraction") -> np.ndarray:
+    """
+    Convert identity percentages to distances.
+    mode:
+      - 'one_minus_fraction': D = 1 - (identity/100)
+      - 'hundred_minus_percent': D = 100 - identity
+    Returns a square distance matrix (float32).
+    """
+    if mode == "one_minus_fraction":
+        D = 1.0 - (mat.astype(np.float32) / 100.0)
+    elif mode == "hundred_minus_percent":
+        D = 100.0 - mat.astype(np.float32)
+    else:
+        raise ValueError(f"Unknown distance mode: {mode}")
+    # force zeros on diagonal; clip tiny negatives that may arise numerically
+    np.fill_diagonal(D, 0.0)
+    D[D < 0] = 0.0
+    return D
+
+
+def pcoa_from_distance(D: np.ndarray, n_components: int = 2):
+    """
+    Classical MDS / PCoA on a square distance matrix D.
+    Returns (coords, eigenvalues, explained_variance), where:
+      - coords: (n, k) principal coordinates
+      - eigenvalues: (n,) sorted descending
+      - explained_variance: (k,) fraction of variance per axis
+    """
+    if D.shape[0] != D.shape[1]:
+        raise ValueError(f"Distance matrix must be square, got {D.shape}")
+    n = D.shape[0]
+    if n < 2:
+        raise ValueError("Need at least 2 points for PCoA.")
+
+    # Double-centering: B = -0.5 * J * D^2 * J
+    J = np.eye(n, dtype=np.float64) - np.ones((n, n), dtype=np.float64) / n
+    D2 = (D.astype(np.float64)) ** 2
+    B = -0.5 * (J @ D2 @ J)
+
+    # Eigen-decomposition
+    evals, evecs = np.linalg.eigh(B)  # returns ascending order
+    idx = np.argsort(evals)[::-1]
+    evals = evals[idx]
+    evecs = evecs[:, idx]
+
+    # Keep positive eigenvalues only
+    pos = evals > 0
+    if not np.any(pos):
+        raise ValueError("No positive eigenvalues in PCoA; check your distance matrix.")
+    evals_pos = evals[pos]
+    evecs_pos = evecs[:, pos]
+
+    k = min(n_components, evecs_pos.shape[1])
+    lam = evals_pos[:k]
+    vecs = evecs_pos[:, :k]
+    coords = vecs * np.sqrt(lam)
+
+    explained = lam / np.sum(evals_pos)
+    return coords.astype(np.float32), evals.astype(np.float32), explained.astype(np.float32)
+
+
+def _make_simple_palette(labels: list[str]) -> dict[str, str]:
+    """
+    Stable palette for arbitrary category labels.
+    Uses tab20 then repeats if needed.
+    """
+    cmap = plt.get_cmap("tab20")
+    palette = {}
+    for i, lab in enumerate(labels):
+        palette[lab] = mcolors.to_hex(cmap(i % cmap.N))
+    return palette
+
+
+# ---------- PCoA utilities ----------
+def identities_to_distance(mat: np.ndarray, mode: str = "one_minus_fraction") -> np.ndarray:
+    """
+    Convert identity percentages to distances.
+    mode:
+      - 'one_minus_fraction': D = 1 - (identity/100)
+      - 'hundred_minus_percent': D = 100 - identity
+    Returns a square distance matrix (float32).
+    """
+    if mode == "one_minus_fraction":
+        D = 1.0 - (mat.astype(np.float32) / 100.0)
+    elif mode == "hundred_minus_percent":
+        D = 100.0 - mat.astype(np.float32)
+    else:
+        raise ValueError(f"Unknown distance mode: {mode}")
+    # force zeros on diagonal; clip tiny negatives that may arise numerically
+    np.fill_diagonal(D, 0.0)
+    D[D < 0] = 0.0
+    return D
+
+
+def pcoa_from_distance(D: np.ndarray, n_components: int = 2):
+    """
+    Classical MDS / PCoA on a square distance matrix D.
+    Returns (coords, eigenvalues, explained_variance), where:
+      - coords: (n, k) principal coordinates
+      - eigenvalues: (n,) sorted descending
+      - explained_variance: (k,) fraction of variance per axis
+    """
+    if D.shape[0] != D.shape[1]:
+        raise ValueError(f"Distance matrix must be square, got {D.shape}")
+    n = D.shape[0]
+    if n < 2:
+        raise ValueError("Need at least 2 points for PCoA.")
+
+    # Double-centering: B = -0.5 * J * D^2 * J
+    J = np.eye(n, dtype=np.float64) - np.ones((n, n), dtype=np.float64) / n
+    D2 = (D.astype(np.float64)) ** 2
+    B = -0.5 * (J @ D2 @ J)
+
+    # Eigen-decomposition
+    evals, evecs = np.linalg.eigh(B)  # returns ascending order
+    idx = np.argsort(evals)[::-1]
+    evals = evals[idx]
+    evecs = evecs[:, idx]
+
+    # Keep positive eigenvalues only
+    pos = evals > 0
+    if not np.any(pos):
+        raise ValueError("No positive eigenvalues in PCoA; check your distance matrix.")
+    evals_pos = evals[pos]
+    evecs_pos = evecs[:, pos]
+
+    k = min(n_components, evecs_pos.shape[1])
+    lam = evals_pos[:k]
+    vecs = evecs_pos[:, :k]
+    coords = vecs * np.sqrt(lam)
+
+    explained = lam / np.sum(evals_pos)
+    return coords.astype(np.float32), evals.astype(np.float32), explained.astype(np.float32)
+
+
+def _make_simple_palette(labels: list[str]) -> dict[str, str]:
+    """
+    Stable palette for arbitrary category labels.
+    Uses tab20 then repeats if needed.
+    """
+    cmap = plt.get_cmap("tab20")
+    palette = {}
+    for i, lab in enumerate(labels):
+        palette[lab] = mcolors.to_hex(cmap(i % cmap.N))
+    return palette
+
+
+def plot_pcoa_from_square(
+    square_tsv: Path,
+    taxonomy_tsv: Path,
+    out_png: Path,
+    color_level: str = "species",           # 'species' or 'genus'
+    distance_mode: str = "one_minus_fraction",
+    names: list[str] | None = None,         # optional filter (normalized later as-is)
+    out_coords_csv: Path | None = None,
+    label_points: bool = False,
+) -> None:
+    """
+    Run PCoA from the square identity matrix and plot colored by genus/species.
+    If 'names' is provided, keep only IDs whose category is in 'names'.
+    """
+    # Load identities and IDs in their current order
+    mat, ids = load_identity_square(square_tsv)
+    id2sp, id2gen = load_id_to_species_and_genus(taxonomy_tsv)
+
+    # Choose mapper
+    if color_level == "genus":
+        mapper = id2gen
+    elif color_level == "species":
+        mapper = id2sp
+    else:
+        raise ValueError("--pcoa-color-level must be 'genus' or 'species'.")
+
+    # Categories for each id
+    cats = [mapper.get(sid, "Unclassified") for sid in ids]
+
+    # Optional filtering by names (exact match to mapper output)
+    if names:
+        names_set = set(names)
+        keep = [i for i, c in enumerate(cats) if c in names_set]
+        if len(keep) == 0:
+            # Save an empty plot with a message for consistency with your style
+            plt.figure(figsize=(7, 6), dpi=150)
+            plt.title("No sequences for requested categories in PCoA")
+            plt.tight_layout()
+            ensure_outdir(out_png)
+            plt.savefig(out_png, bbox_inches="tight")
+            plt.close()
+            return
+        ids = [ids[i] for i in keep]
+        cats = [cats[i] for i in keep]
+        mat = mat[np.ix_(keep, keep)]
+
+    # Convert to distances and run PCoA
+    D = identities_to_distance(mat, mode=distance_mode)
+    coords, evals, explained = pcoa_from_distance(D, n_components=2)
+
+    # Build palette for the present categories
+    present = sorted(set(cats))
+    palette = _make_simple_palette(present)
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(7.5, 6.2), dpi=150)
+    for cat in present:
+        idx = [i for i, c in enumerate(cats) if c == cat]
+        xy = coords[idx, :]
+        ax.scatter(xy[:, 0], xy[:, 1], s=20, alpha=0.9, label=cat, color=palette[cat])
+
+    if label_points and len(ids) <= 200:
+        # avoid clutter for large n
+        for (x, y), lab in zip(coords, ids):
+            ax.text(x, y, lab, fontsize=6, va="center", ha="left")
+
+    ax.set_xlabel(f"PCoA1 ({explained[0]*100:.1f}% var.)")
+    ax.set_ylabel(f"PCoA2 ({explained[1]*100:.1f}% var.)")
+    ax.set_title(f"PCoA of pairwise distances (colored by {color_level})")
+    ax.axhline(0, lw=0.5, color="#999", alpha=0.5)
+    ax.axvline(0, lw=0.5, color="#999", alpha=0.5)
+
+    # Reasonable aspect and legend outside
+    ax.set_aspect("auto")
+    leg = ax.legend(title=color_level.capitalize(), fontsize=8, frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
+    fig.tight_layout()
+    ensure_outdir(out_png)
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+
+    # Optional CSV of coordinates
+    if out_coords_csv:
+        ensure_outdir(out_coords_csv)
+        df = pd.DataFrame({
+            "id": ids,
+            "category": cats,
+            "PCoA1": coords[:, 0],
+            "PCoA2": coords[:, 1],
+        })
+        # add explained variance as metadata-like extra rows (prefixed)
+        df.to_csv(out_coords_csv, index=False)
+
+
+def plot_pcoa_from_square(
+    square_tsv: Path,
+    taxonomy_tsv: Path,
+    out_png: Path,
+    color_level: str = "species",           # 'species' or 'genus'
+    distance_mode: str = "one_minus_fraction",
+    names: list[str] | None = None,         # optional filter (normalized later as-is)
+    out_coords_csv: Path | None = None,
+    label_points: bool = False,
+) -> None:
+    """
+    Run PCoA from the square identity matrix and plot colored by genus/species.
+    If 'names' is provided, keep only IDs whose category is in 'names'.
+    """
+    # Load identities and IDs in their current order
+    mat, ids = load_identity_square(square_tsv)
+    id2sp, id2gen = load_id_to_species_and_genus(taxonomy_tsv)
+
+    # Choose mapper
+    if color_level == "genus":
+        mapper = id2gen
+    elif color_level == "species":
+        mapper = id2sp
+    else:
+        raise ValueError("--pcoa-color-level must be 'genus' or 'species'.")
+
+    # Categories for each id
+    cats = [mapper.get(sid, "Unclassified") for sid in ids]
+
+    # Optional filtering by names (exact match to mapper output)
+    if names:
+        names_set = set(names)
+        keep = [i for i, c in enumerate(cats) if c in names_set]
+        if len(keep) == 0:
+            # Save an empty plot with a message for consistency with your style
+            plt.figure(figsize=(7, 6), dpi=150)
+            plt.title("No sequences for requested categories in PCoA")
+            plt.tight_layout()
+            ensure_outdir(out_png)
+            plt.savefig(out_png, bbox_inches="tight")
+            plt.close()
+            return
+        ids = [ids[i] for i in keep]
+        cats = [cats[i] for i in keep]
+        mat = mat[np.ix_(keep, keep)]
+
+    # Convert to distances and run PCoA
+    D = identities_to_distance(mat, mode=distance_mode)
+    coords, evals, explained = pcoa_from_distance(D, n_components=2)
+
+    # Build palette for the present categories
+    present = sorted(set(cats))
+    palette = _make_simple_palette(present)
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(7.5, 6.2), dpi=150)
+    for cat in present:
+        idx = [i for i, c in enumerate(cats) if c == cat]
+        xy = coords[idx, :]
+        ax.scatter(xy[:, 0], xy[:, 1], s=20, alpha=0.9, label=cat, color=palette[cat])
+
+    if label_points and len(ids) <= 200:
+        # avoid clutter for large n
+        for (x, y), lab in zip(coords, ids):
+            ax.text(x, y, lab, fontsize=6, va="center", ha="left")
+
+    ax.set_xlabel(f"PCoA1 ({explained[0]*100:.1f}% var.)")
+    ax.set_ylabel(f"PCoA2 ({explained[1]*100:.1f}% var.)")
+    ax.set_title(f"PCoA of pairwise distances (colored by {color_level})")
+    ax.axhline(0, lw=0.5, color="#999", alpha=0.5)
+    ax.axvline(0, lw=0.5, color="#999", alpha=0.5)
+
+    # Reasonable aspect and legend outside
+    ax.set_aspect("auto")
+    leg = ax.legend(title=color_level.capitalize(), fontsize=8, frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
+    fig.tight_layout()
+    ensure_outdir(out_png)
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+
+    # Optional CSV of coordinates
+    if out_coords_csv:
+        ensure_outdir(out_coords_csv)
+        df = pd.DataFrame({
+            "id": ids,
+            "category": cats,
+            "PCoA1": coords[:, 0],
+            "PCoA2": coords[:, 1],
+        })
+        # add explained variance as metadata-like extra rows (prefixed)
+        df.to_csv(out_coords_csv, index=False)
+
+
 # ---------- argparse ----------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -376,6 +711,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--edge-linewidth", type=float, default=EDGE_LINEWIDTH_DEFAULT)
     p.add_argument("--inter-color", default=INTER_COLOR_DEFAULT, help="Color for 'inter' category.")
     p.add_argument("--drop-self", action="store_true", help="Drop self pairs (q==t) before histograms.")
+
+
+    # PCoA outputs & options
+    p.add_argument("--out-pcoa", type=Path, help="Output PNG for PCoA scatter.")
+    p.add_argument("--out-pcoa-csv", type=Path, help="Optional CSV to save PCoA coordinates.")
+    p.add_argument("--pcoa-color-level", choices=["genus", "species"], default="species",
+                   help="Taxonomic level to color PCoA points (default: species).")
+    p.add_argument("--pcoa-distance", choices=["one_minus_fraction", "hundred_minus_percent"],
+                   default="one_minus_fraction",
+                   help="How to convert identities to distances for PCoA (default: 1 - identity/100).")
+    p.add_argument("--pcoa-label-points", action="store_true", help="Label points with sequence IDs on the PCoA.")
+
 
     return p.parse_args()
 
@@ -432,6 +779,31 @@ def main() -> None:
         overlay_alpha=args.overlay_alpha,
         edge_color=args.edge_color, edge_lw=args.edge_linewidth, palette=palette
     )
+
+        # ----- PCoA (optional) -----
+    if args.out_pcoa:
+        # Reuse parsed names (may be empty)
+        names_for_pcoa = names if names else None
+        try:
+            plot_pcoa_from_square(
+                square_tsv=args.square,
+                taxonomy_tsv=args.taxonomy,
+                out_png=args.out_pcoa,
+                color_level=args.pcoa_color_level,
+                distance_mode=args.pcoa_distance,
+                names=names_for_pcoa,
+                out_coords_csv=getattr(args, "out_pcoa_csv", None),
+                label_points=args.pcoa_label_points,
+            )
+        except Exception as e:
+            # Produce a diagnostic image instead of failing hard (keeps your UX consistent)
+            plt.figure(figsize=(7, 6), dpi=150)
+            plt.title(f"PCoA failed: {e}")
+            plt.tight_layout()
+            ensure_outdir(args.out_pcoa)
+            plt.savefig(args.out_pcoa, bbox_inches="tight")
+            plt.close()
+
 
 
 if __name__ == "__main__":

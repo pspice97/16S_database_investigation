@@ -19,6 +19,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.transforms import blended_transform_factory
 import matplotlib.colors as mcolors
+try:
+    from sklearn.manifold import TSNE
+except Exception:
+    TSNE = None
 
 # ---------- defaults ----------
 THRESHOLD_DEFAULT = 40.0
@@ -710,6 +714,161 @@ def plot_pcoa_from_square(
         df.to_csv(out_coords_csv, index=False)
 
 
+def plot_tsne_from_square(
+    square_tsv: Path,
+    taxonomy_tsv: Path,
+    out_png: Path,
+    color_level: str = "species",           # 'species' or 'genus'
+    distance_mode: str = "one_minus_fraction",
+    names: list[str] | None = None,         # optional filter (exact match to mapper output)
+    out_coords_csv: Path | None = None,
+    label_points: bool = False,
+    label_max: int = 200,
+    label_size: float = 6.0,
+    perplexity: float = 30.0,
+    learning_rate: float = 200.0,           # use 'auto' if you know sklearn>=1.2
+    early_exaggeration: float = 12.0,
+    n_iter: int = 1000,
+    angle: float = 0.5,                     # Barnes-Hut trade-off
+    random_state: int = 42,
+    init_mode: str = "random",              # 'random' or 'pcoa'
+):
+    """
+    t-SNE on a distance matrix derived from pairwise identities.
+    metric='precomputed' (so we feed a distance matrix directly).
+    """
+    if TSNE is None:
+        # Friendly diagnostic image if scikit-learn is missing
+        plt.figure(figsize=(7, 6), dpi=150)
+        plt.title("t-SNE requires scikit-learn. Please 'pip install scikit-learn'.")
+        plt.tight_layout()
+        ensure_outdir(out_png)
+        plt.savefig(out_png, bbox_inches="tight")
+        plt.close()
+        return
+
+    # Load identities and taxonomy
+    mat, ids = load_identity_square(square_tsv)
+    id2sp, id2gen = load_id_to_species_and_genus(taxonomy_tsv)
+
+    # Choose mapper (coloring / filtering level)
+    if color_level == "genus":
+        mapper = id2gen
+    elif color_level == "species":
+        mapper = id2sp
+    else:
+        raise ValueError("--tsne-color-level must be 'genus' or 'species'.")
+
+    cats = [mapper.get(sid, "Unclassified") for sid in ids]
+
+    # Optional filtering
+    if names:
+        names_set = set(names)
+        keep = [i for i, c in enumerate(cats) if c in names_set]
+        if len(keep) == 0:
+            plt.figure(figsize=(7, 6), dpi=150)
+            plt.title("No sequences for requested categories in t-SNE")
+            plt.tight_layout()
+            ensure_outdir(out_png)
+            plt.savefig(out_png, bbox_inches="tight")
+            plt.close()
+            return
+        ids = [ids[i] for i in keep]
+        cats = [cats[i] for i in keep]
+        mat = mat[np.ix_(keep, keep)]
+
+    n = len(ids)
+    if n < 3:
+        plt.figure(figsize=(7, 6), dpi=150)
+        plt.title(f"Not enough points for t-SNE (n={n})")
+        plt.tight_layout()
+        ensure_outdir(out_png)
+        plt.savefig(out_png, bbox_inches="tight")
+        plt.close()
+        return
+
+    # Convert identities -> distances
+    D = identities_to_distance(mat, mode=distance_mode)
+
+    # Perplexity must be < (n - 1) / 3 (sklearn requirement)
+    max_perp = max(1.0, (n - 1) / 3.0 - 1e-9)
+    if perplexity >= max_perp:
+        perplexity = max(1.0, min(30.0, max_perp))  # clamp to a safe default
+        # (we could also warn on-plot; keep it silent for batch runs)
+
+    # Optional init from PCoA for stability (especially when n is small)
+    init = "random"
+    if init_mode == "pcoa":
+        try:
+            D_for_pcoa = D  # already computed
+            coords_pcoa, _, _ = pcoa_from_distance(D_for_pcoa, n_components=2)
+            init = coords_pcoa  # ndarray (n, 2)
+        except Exception:
+            init = "random"
+
+    # Run t-SNE on precomputed distances
+    tsne = TSNE(
+        n_components=2,
+        metric="precomputed",
+        init=init,
+        perplexity=perplexity,
+        learning_rate=learning_rate,
+        early_exaggeration=early_exaggeration,
+        n_iter=n_iter,
+        angle=angle,
+        random_state=random_state,
+        verbose=0,
+        n_jobs=None if hasattr(TSNE, "n_jobs") else None,  # ignore if not present
+    )
+    coords = tsne.fit_transform(D)  # (n, 2)
+
+    # Coloring
+    present = sorted(set(cats))
+    palette = _make_simple_palette(present)
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(7.5, 6.2), dpi=150)
+    for cat in present:
+        idx = [i for i, c in enumerate(cats) if c == cat]
+        xy = coords[idx, :]
+        ax.scatter(xy[:, 0], xy[:, 1], s=20, alpha=0.95, label=cat, color=palette[cat])
+
+    # Optional labels (sequence IDs)
+    if label_points:
+        if len(ids) > label_max:
+            ax.text(0.99, 0.01,
+                    f"Labels suppressed ({len(ids)}>{label_max}). "
+                    f"Use --tsne-label-max to override.",
+                    transform=ax.transAxes, ha="right", va="bottom", fontsize=8)
+        else:
+            try:
+                from matplotlib.patheffects import Stroke, Normal
+                pe = [Stroke(linewidth=2.0, foreground="white", alpha=0.9), Normal()]
+            except Exception:
+                pe = None
+            for (x, y), lab in zip(coords, ids):
+                ax.text(x, y, lab, fontsize=label_size, va="center", ha="left",
+                        path_effects=pe)
+
+    ax.set_xlabel("t-SNE 1")
+    ax.set_ylabel("t-SNE 2")
+    ax.set_title(f"t-SNE of pairwise distances (colored by {color_level})")
+    ax.axhline(0, lw=0.5, color="#999", alpha=0.5)
+    ax.axvline(0, lw=0.5, color="#999", alpha=0.5)
+
+    leg = ax.legend(title=color_level.capitalize(), fontsize=8, frameon=False,
+                    bbox_to_anchor=(1.02, 1), loc="upper left")
+    fig.tight_layout()
+    ensure_outdir(out_png)
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+
+    # Optional CSV dump
+    if out_coords_csv:
+        ensure_outdir(out_coords_csv)
+        pd.DataFrame({"id": ids, "category": cats, "tSNE1": coords[:, 0], "tSNE2": coords[:, 1]}).to_csv(out_coords_csv, index=False)
+
+
 # ---------- argparse ----------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -761,6 +920,30 @@ def parse_args() -> argparse.Namespace:
                help="Maximum number of points to label to avoid clutter (default: 200).")
     p.add_argument("--pcoa-label-size", type=float, default=6.0,
                help="Font size for PCoA point labels (default: 6).")
+    
+
+        # t-SNE outputs & options
+    p.add_argument("--out-tsne", type=Path, help="Output PNG for t-SNE scatter.")
+    p.add_argument("--out-tsne-csv", type=Path, help="Optional CSV to save t-SNE coordinates.")
+    p.add_argument("--tsne-color-level", choices=["genus", "species"], default="species",
+                help="Taxonomic level to color t-SNE points (default: species).")
+    p.add_argument("--tsne-distance", choices=["one_minus_fraction", "hundred_minus_percent"],
+                default="one_minus_fraction",
+                help="How to convert identities to distances for t-SNE (default: 1 - identity/100).")
+    p.add_argument("--tsne-label-points", action="store_true", help="Label t-SNE points with sequence IDs.")
+    p.add_argument("--tsne-label-max", type=int, default=200, help="Max points to label (default: 200).")
+    p.add_argument("--tsne-label-size", type=float, default=6.0, help="Font size for t-SNE labels (default: 6).")
+
+    # Core t-SNE hyperparameters
+    p.add_argument("--tsne-perplexity", type=float, default=30.0, help="t-SNE perplexity (default: 30).")
+    p.add_argument("--tsne-learning-rate", type=float, default=200.0, help="t-SNE learning rate (default: 200).")
+    p.add_argument("--tsne-early-exaggeration", type=float, default=12.0, help="t-SNE early exaggeration (default: 12).")
+    p.add_argument("--tsne-n-iter", type=int, default=1000, help="t-SNE iterations (default: 1000).")
+    p.add_argument("--tsne-angle", type=float, default=0.5, help="Barnes-Hut angle (default: 0.5).")
+    p.add_argument("--tsne-random-state", type=int, default=42, help="Random seed for reproducibility (default: 42).")
+    p.add_argument("--tsne-init", choices=["random", "pcoa"], default="random",
+                help="Initialization: 'random' or initialize from PCoA coordinates (default: random).")
+
 
     return p.parse_args()
 
@@ -844,6 +1027,37 @@ def main() -> None:
             ensure_outdir(args.out_pcoa)
             plt.savefig(args.out_pcoa, bbox_inches="tight")
             plt.close()
+    
+    # ----- t-SNE (optional) -----
+    if args.out_tsne:
+        try:
+            plot_tsne_from_square(
+                square_tsv=args.square,
+                taxonomy_tsv=args.taxonomy,
+                out_png=args.out_tsne,
+                color_level=args.tsne_color_level,
+                distance_mode=args.tsne_distance,
+                names=names if names else None,
+                out_coords_csv=getattr(args, "out_tsne_csv", None),
+                label_points=args.tsne_label_points,
+                label_max=args.tsne_label_max,
+                label_size=args.tsne_label_size,
+                perplexity=args.tsne_perplexity,
+                learning_rate=args.tsne_learning_rate,
+                early_exaggeration=args.tsne_early_exaggeration,
+                n_iter=args.tsne_n_iter,
+                angle=args.tsne_angle,
+                random_state=args.tsne_random_state,
+                init_mode=args.tsne_init,
+            )
+        except Exception as e:
+            plt.figure(figsize=(7, 6), dpi=150)
+            plt.title(f"t-SNE failed: {e}")
+            plt.tight_layout()
+            ensure_outdir(args.out_tsne)
+            plt.savefig(args.out_tsne, bbox_inches="tight")
+            plt.close()
+
 
 
 

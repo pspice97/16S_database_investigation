@@ -757,8 +757,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pcoa-label-points", action="store_true", help="Label points with sequence IDs on the PCoA.")
 
     # in parse_args()
-    p.add_argument("--pcoa-label-points", action="store_true",
-               help="Label PCoA points with sequence IDs.")
     p.add_argument("--pcoa-label-max", type=int, default=200,
                help="Maximum number of points to label to avoid clutter (default: 200).")
     p.add_argument("--pcoa-label-size", type=float, default=6.0,

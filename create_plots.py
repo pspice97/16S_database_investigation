@@ -814,7 +814,6 @@ def plot_tsne_from_square(
         perplexity=perplexity,
         learning_rate=learning_rate,
         early_exaggeration=early_exaggeration,
-        n_iter=n_iter,
         angle=angle,
         random_state=random_state,
         verbose=0,

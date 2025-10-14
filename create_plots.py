@@ -481,14 +481,26 @@ def pcoa_from_distance(D: np.ndarray, n_components: int = 2):
 
 def _make_simple_palette(labels: list[str]) -> dict[str, str]:
     """
-    Stable palette for arbitrary category labels.
-    Uses tab20 then repeats if needed.
+    Stable, colorblind-safe palette (Okabe–Ito) for up to 8 groups.
+    Falls back to tab20 if more are needed.
     """
-    cmap = plt.get_cmap("tab20")
-    palette = {}
-    for i, lab in enumerate(labels):
-        palette[lab] = mcolors.to_hex(cmap(i % cmap.N))
-    return palette
+    okabe_ito = [
+        "#0072B2",  # blue
+        "#D55E00",  # vermilion
+        "#009E73",  # bluish green
+        "#CC79A7",  # reddish purple
+        "#F0E442",  # yellow
+        "#56B4E9",  # sky blue
+        "#000000",  # black
+        "#E69F00",  # orange
+    ]
+    if len(labels) <= len(okabe_ito):
+        colors = okabe_ito[:len(labels)]
+    else:
+        cmap = plt.get_cmap("tab20")
+        colors = [mcolors.to_hex(cmap(i % cmap.N)) for i in range(len(labels))]
+    return {lab: colors[i] for i, lab in enumerate(labels)}
+
 
 
 def plot_pcoa_from_square(

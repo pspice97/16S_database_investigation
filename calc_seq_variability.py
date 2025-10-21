@@ -277,10 +277,11 @@ def run_multi_taxon(tree,
     seqs = [p[3] for p in present]
     n = len(ids)
 
+    # Only compute upper triangle (including diagonal) and mirror results.
     tasks: List[PairTask] = []
     for i in range(n):
-        for j in range(n):
-            need_strings = save_alignments and (i <= j)
+        for j in range(i, n):  # j >= i → upper triangle
+            need_strings = save_alignments  # all tasks satisfy i <= j
             tasks.append(PairTask(i=i, j=j, id_i=ids[i], id_j=ids[j],
                                   seq_i=seqs[i], seq_j=seqs[j],
                                   need_alignment_strings=need_strings))
@@ -293,7 +294,8 @@ def run_multi_taxon(tree,
         for fut in as_completed(futures):
             i, j, ident, s1, s2 = fut.result()
             identity_matrix[i][j] = ident
-            if save_alignments and i <= j and s1 is not None and s2 is not None:
+            identity_matrix[j][i] = ident  # mirror to lower triangle
+            if save_alignments and s1 is not None and s2 is not None:
                 align_results.append((i, j, ident, s1, s2))
 
     # Use the human-readable label here; write_identity_tables will sanitize consistently
@@ -403,4 +405,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

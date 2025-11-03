@@ -13,13 +13,21 @@ This script:
       • Needleman–Wunsch (global, free end gaps)
       • Smith–Waterman (local)
     based on:
-      - if an ID→string CSV is provided:
-          * if both IDs have labels AND labels match AND
-            len(shorter) ≥ 0.9 * len(longer) → Needleman–Wunsch
-          * else → Smith–Waterman
-      - if no CSV is provided:
-          * if len(shorter) ≥ 0.9 * len(longer) → Needleman–Wunsch
-          * else → Smith–Waterman
+
+      If an ID→string CSV is provided:
+        - let label_i, label_j be the labels for the two IDs (if present)
+        - if both labels exist and are equal AND
+             len(shorter) >= 0.9 * len(longer)
+             → use Needleman–Wunsch (global, free end gaps)
+        - else if both labels exist and differ:
+             • if one label is a substring of the other → Smith–Waterman (local)
+             • otherwise → skip this pair (no alignment)
+        - else (at least one label missing) → skip this pair (no alignment)
+
+      If no CSV is provided:
+        - if len(shorter) >= 0.9 * len(longer) → Needleman–Wunsch (global, free end gaps)
+        - else → Smith–Waterman (local)
+
   - writes:
       • identities (square matrix TSV)
       • identities (long/tidy TSV)
@@ -91,7 +99,7 @@ def _make_aligner(mode: str) -> PairwiseAligner:
         aligner.target_end_gap_score = 0
         aligner.query_end_gap_score = 0
 
-    # For local mode, end-gap scores are irrelevant by definition.
+    # For local mode, end-gap scores are inherent to local alignment.
     return aligner
 
 
@@ -298,15 +306,25 @@ def _decide_alignment_mode(
     seq_j: str,
     id_to_label: Dict[str, str] | None,
     length_ratio_threshold: float = 0.9,
-) -> str:
+) -> str | None:
     """
-    Decide per-pair alignment mode ("global" for Needleman–Wunsch, "local" for Smith–Waterman)
-    based on the rules:
+    Decide per-pair alignment mode.
+
+    Returns:
+      - "global" → use Needleman–Wunsch (free-end gaps)
+      - "local"  → use Smith–Waterman
+      - None     → do not perform any alignment for this pair
+                   (identity stays at the default value, e.g. 0.0)
+
+    Rules:
 
     If id_to_label is provided:
       - if both IDs have labels AND labels match AND
         len(shorter) >= threshold * len(longer) → "global"
-      - else → "local"
+      - else if both IDs have labels AND labels differ:
+          * if one label is a substring of the other → "local"
+          * else → None  (no alignment)
+      - else (at least one label missing) → None (no alignment)
 
     If id_to_label is not provided:
       - if len(shorter) >= threshold * len(longer) → "global"
@@ -318,15 +336,29 @@ def _decide_alignment_mode(
     longer = max(len_i, len_j)
     len_ok = shorter >= length_ratio_threshold * longer
 
-    if id_to_label is not None:
-        li = id_to_label.get(id_i)
-        lj = id_to_label.get(id_j)
-        if li is not None and lj is not None and li == lj and len_ok:
-            return "global"
-        else:
-            return "local"
-    else:
+    # No CSV: just length-based global vs local
+    if id_to_label is None:
         return "global" if len_ok else "local"
+
+    # CSV is provided: use label logic
+    li = id_to_label.get(id_i)
+    lj = id_to_label.get(id_j)
+
+    # If both labels are present
+    if li is not None and lj is not None:
+        if li == lj and len_ok:
+            # Same label + sufficient length similarity → Needleman–Wunsch
+            return "global"
+
+        # Labels differ: only align if one label is substring of the other → Smith–Waterman
+        if li in lj or lj in li:
+            return "local"
+
+        # Labels differ and no substring relationship → no alignment
+        return None
+
+    # At least one label missing: treat as non-matching labels → no alignment
+    return None
 
 
 # ---------------------- Workflow ----------------------
@@ -372,13 +404,20 @@ def run_multi_taxon(tree,
     seqs = [p[3] for p in present]
     n = len(ids)
 
-    # Only compute upper triangle (including diagonal) and mirror results.
+    # Initialize matrix with 0.0; skipped pairs will remain 0.0
+    identity_matrix = [[0.0] * n for _ in range(n)]
     tasks: List[PairTask] = []
+
     for i in range(n):
         for j in range(i, n):  # j >= i → upper triangle
             mode = _decide_alignment_mode(
                 ids[i], ids[j], seqs[i], seqs[j], id_to_label, length_ratio_threshold
             )
+
+            # If mode is None, we skip this pair entirely (no alignment)
+            if mode is None:
+                continue
+
             need_strings = save_alignments  # all tasks satisfy i <= j
             tasks.append(
                 PairTask(
@@ -393,22 +432,22 @@ def run_multi_taxon(tree,
                 )
             )
 
-    identity_matrix = [[0.0] * n for _ in range(n)]
     align_results: List[Tuple[int, int, float, str, str]] = []
 
-    with ProcessPoolExecutor(max_workers=workers or None) as ex:
-        futures = {ex.submit(_align_and_identity_worker, t): t for t in tasks}
-        for fut in as_completed(futures):
-            i, j, ident, s1, s2 = fut.result()
-            identity_matrix[i][j] = ident
-            identity_matrix[j][i] = ident  # mirror to lower triangle
-            if save_alignments and s1 is not None and s2 is not None:
-                align_results.append((i, j, ident, s1, s2))
+    if tasks:
+        with ProcessPoolExecutor(max_workers=workers or None) as ex:
+            futures = {ex.submit(_align_and_identity_worker, t): t for t in tasks}
+            for fut in as_completed(futures):
+                i, j, ident, s1, s2 = fut.result()
+                identity_matrix[i][j] = ident
+                identity_matrix[j][i] = ident  # mirror to lower triangle
+                if save_alignments and s1 is not None and s2 is not None:
+                    align_results.append((i, j, ident, s1, s2))
 
     # Use the human-readable label here; write_identity_tables will sanitize consistently
     write_identity_tables(identity_matrix, ids, raw_label, outdir=outdir)
 
-    if save_alignments:
+    if save_alignments and align_results:
         with align_path.open("w") as fh:
             for i, j, ident, s1, s2 in sorted(align_results, key=lambda x: (x[0], x[1])):
                 _write_alignment_block(fh, ids[i], ids[j], s1, s2, ident)
@@ -490,8 +529,8 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional CSV with two columns: sequence ID and a string label. "
-            "If provided, per-pair alignment mode (Needleman–Wunsch vs Smith–Waterman) "
-            "is chosen using ID labels and length ratios as described in the script docstring."
+            "If provided, per-pair alignment mode and whether to align at all "
+            "are chosen using ID labels and length ratios as described in the script docstring."
         ),
     )
 
@@ -528,4 +567,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

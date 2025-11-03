@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 r"""
-Pairwise global-align identities for selected taxa.
+Pairwise global-/local-align identities for selected taxa.
 
 Given:
   - a nucleotide FASTA
   - a taxonomy TSV compatible with `tax_tree.build_tree`
+  - optionally: a CSV mapping sequence IDs to strings (labels)
 
 This script:
   - selects sequences under one or more taxa at a given rank (default: genus)
-  - computes all-vs-all global alignments (Needleman–Wunsch w/ free end gaps)
+  - computes all-vs-all pairwise alignments with per-pair choice of:
+      • Needleman–Wunsch (global, free end gaps)
+      • Smith–Waterman (local)
+    based on:
+      - if an ID→string CSV is provided:
+          * if both IDs have labels AND labels match AND
+            len(shorter) ≥ 0.9 * len(longer) → Needleman–Wunsch
+          * else → Smith–Waterman
+      - if no CSV is provided:
+          * if len(shorter) ≥ 0.9 * len(longer) → Needleman–Wunsch
+          * else → Smith–Waterman
   - writes:
       • identities (square matrix TSV)
       • identities (long/tidy TSV)
@@ -24,6 +35,11 @@ Examples (semicolon-separated; '_' inside species):
 
   # taxa file (one per line; same rule)
   python script.py data/genes.fna data/taxonomy.tsv --taxa-file taxa.txt --rank species
+
+  # with ID→string CSV
+  python script.py data/genes.fna data/taxonomy.tsv \
+    --taxa "Bacteroides" \
+    --id-strings-csv id_to_label.csv
 
 Requirements:
   - biopython
@@ -56,16 +72,26 @@ def _sanitize_label(s: str) -> str:
 
 # ---------------------- Alignment config ----------------------
 
-def _make_aligner() -> PairwiseAligner:
-    """Create and configure a global aligner (free end gaps)."""
+def _make_aligner(mode: str) -> PairwiseAligner:
+    """
+    Create and configure a pairwise aligner.
+
+    mode: "global" (Needleman–Wunsch with free end gaps)
+          or "local" (Smith–Waterman)
+    """
     aligner = PairwiseAligner()
-    aligner.mode = "global"
+    aligner.mode = mode
     aligner.open_gap_score = -10
     aligner.extend_gap_score = -0.5
     aligner.match_score = 1
     aligner.mismatch_score = -1
-    aligner.target_end_gap_score = 0
-    aligner.query_end_gap_score = 0
+
+    if mode == "global":
+        # Free end gaps (semi-global behavior)
+        aligner.target_end_gap_score = 0
+        aligner.query_end_gap_score = 0
+
+    # For local mode, end-gap scores are irrelevant by definition.
     return aligner
 
 
@@ -93,6 +119,31 @@ def parse_fasta_file(path: Path) -> Dict[str, str]:
                 seqs[header].append(line.upper())
 
     return {h: "".join(chunks) for h, chunks in seqs.items()}
+
+
+def parse_id_strings_csv(path: Path) -> Dict[str, str]:
+    """
+    Parse an optional ID→string CSV.
+
+    Expects at least two columns:
+      col 0: sequence ID (matching FASTA header IDs)
+      col 1: string label
+
+    Returns: {sequence_id: label}
+    """
+    mapping: Dict[str, str] = {}
+    with path.open(newline="") as fh:
+        reader = csv.reader(fh)
+        for row in reader:
+            if not row:
+                continue
+            if len(row) < 2:
+                continue
+            sid = row[0].strip()
+            label = row[1].strip()
+            if sid:
+                mapping[sid] = label
+    return mapping
 
 
 def write_identity_tables(identity_matrix: List[List[float]],
@@ -137,6 +188,7 @@ class PairTask:
     seq_i: str
     seq_j: str
     need_alignment_strings: bool
+    mode: str  # "global" (Needleman–Wunsch) or "local" (Smith–Waterman)
 
 
 def _align_and_identity_worker(task: PairTask) -> Tuple[int, int, float, str | None, str | None]:
@@ -144,7 +196,7 @@ def _align_and_identity_worker(task: PairTask) -> Tuple[int, int, float, str | N
     Worker function for a pair (i, j).
     Returns: (i, j, identity_percent, aligned_query?, aligned_target?)
     """
-    aligner = _make_aligner()
+    aligner = _make_aligner(task.mode)
     aln = aligner.align(task.seq_i, task.seq_j)[0]
     a_blocks, b_blocks = aln.aligned  # coordinate blocks for query and target
 
@@ -183,6 +235,7 @@ def _align_and_identity_worker(task: PairTask) -> Tuple[int, int, float, str | N
                 if x == y:
                     matches += 1
     else:
+        # Count matches directly from aligned blocks without reconstructing full strings
         for (qs, qe), (ts, te) in zip(a_blocks, b_blocks):
             block_len = min(qe - qs, te - ts)
             aligned_len += block_len
@@ -238,6 +291,44 @@ def dedup_by_id(records: Iterable[Tuple[str, str, str, str]]) -> List[Tuple[str,
     return list(seen.values())
 
 
+def _decide_alignment_mode(
+    id_i: str,
+    id_j: str,
+    seq_i: str,
+    seq_j: str,
+    id_to_label: Dict[str, str] | None,
+    length_ratio_threshold: float = 0.9,
+) -> str:
+    """
+    Decide per-pair alignment mode ("global" for Needleman–Wunsch, "local" for Smith–Waterman)
+    based on the rules:
+
+    If id_to_label is provided:
+      - if both IDs have labels AND labels match AND
+        len(shorter) >= threshold * len(longer) → "global"
+      - else → "local"
+
+    If id_to_label is not provided:
+      - if len(shorter) >= threshold * len(longer) → "global"
+      - else → "local"
+    """
+    len_i = len(seq_i)
+    len_j = len(seq_j)
+    shorter = min(len_i, len_j)
+    longer = max(len_i, len_j)
+    len_ok = shorter >= length_ratio_threshold * longer
+
+    if id_to_label is not None:
+        li = id_to_label.get(id_i)
+        lj = id_to_label.get(id_j)
+        if li is not None and lj is not None and li == lj and len_ok:
+            return "global"
+        else:
+            return "local"
+    else:
+        return "global" if len_ok else "local"
+
+
 # ---------------------- Workflow ----------------------
 
 def run_multi_taxon(tree,
@@ -247,10 +338,14 @@ def run_multi_taxon(tree,
                     rank: str,
                     outdir: Path,
                     save_alignments: bool,
-                    workers: int) -> None:
+                    workers: int,
+                    id_to_label: Dict[str, str] | None = None,
+                    length_ratio_threshold: float = 0.9) -> None:
     """
     Multi-taxon workflow across a rank (default: genus).
     Outputs: identity tables; optional alignments.
+
+    Alignment mode per pair is determined by _decide_alignment_mode().
     """
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -281,10 +376,22 @@ def run_multi_taxon(tree,
     tasks: List[PairTask] = []
     for i in range(n):
         for j in range(i, n):  # j >= i → upper triangle
+            mode = _decide_alignment_mode(
+                ids[i], ids[j], seqs[i], seqs[j], id_to_label, length_ratio_threshold
+            )
             need_strings = save_alignments  # all tasks satisfy i <= j
-            tasks.append(PairTask(i=i, j=j, id_i=ids[i], id_j=ids[j],
-                                  seq_i=seqs[i], seq_j=seqs[j],
-                                  need_alignment_strings=need_strings))
+            tasks.append(
+                PairTask(
+                    i=i,
+                    j=j,
+                    id_i=ids[i],
+                    id_j=ids[j],
+                    seq_i=seqs[i],
+                    seq_j=seqs[j],
+                    need_alignment_strings=need_strings,
+                    mode=mode,
+                )
+            )
 
     identity_matrix = [[0.0] * n for _ in range(n)]
     align_results: List[Tuple[int, int, float, str, str]] = []
@@ -346,7 +453,7 @@ def _normalize_taxa_string(raw: str) -> List[str]:
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="pairwise_identities",
-        description="Compute pairwise global-align identities for selected taxa."
+        description="Compute pairwise align identities for selected taxa (global/local per pair)."
     )
     p.add_argument("fasta", type=Path, help="Input nucleotide FASTA (.fna/.fa).")
     p.add_argument("taxonomy", type=Path, help="Taxonomy TSV (kpcofgs).")
@@ -376,6 +483,18 @@ def _parse_args() -> argparse.Namespace:
                    help="Do not write plaintext alignment visualizations.")
     p.add_argument("--workers", type=int, default=0,
                    help="Number of worker processes (default 0 = use CPU count).")
+
+    p.add_argument(
+        "--id-strings-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Optional CSV with two columns: sequence ID and a string label. "
+            "If provided, per-pair alignment mode (Needleman–Wunsch vs Smith–Waterman) "
+            "is chosen using ID labels and length ratios as described in the script docstring."
+        ),
+    )
+
     return p.parse_args()
 
 
@@ -391,6 +510,8 @@ def main() -> None:
     tree = build_tree(str(args.taxonomy))
     species_index = tree.species_to_ids()
 
+    id_to_label = parse_id_strings_csv(args.id_strings_csv) if args.id_strings_csv else None
+
     run_multi_taxon(
         tree=tree,
         fasta_dict=fasta_dict,
@@ -400,8 +521,11 @@ def main() -> None:
         outdir=args.outdir,
         save_alignments=not args.no_alignments,
         workers=args.workers,
+        id_to_label=id_to_label,
+        length_ratio_threshold=0.9,
     )
 
 
 if __name__ == "__main__":
     main()
+
